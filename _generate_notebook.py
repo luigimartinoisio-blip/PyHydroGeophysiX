@@ -262,228 +262,320 @@ sensor_arr = np.array([[float(x), float(z)] for x, z in el_pos])
 print('\nOK  {} posizioni elettrodo pronte - mesh pronta per forward ERT'.format(len(el_pos)))"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CELLA 3 – Discretizzazione Idrologica Flopy / MODFLOW 6
+# CELLA 3 – Griglia MODFLOW 2D (flopy.modflow.ModflowDis) con offset datum
 # ─────────────────────────────────────────────────────────────────────────────
 CELL3 = r"""
 # ═══════════════════════════════════════════════════════════════════════════
-# CELLA 3 – Discretizzazione Idrologica (Flopy / MODFLOW 6)
-#            con Offset di Datum tra Elettrodi e Tensiometri
+# CELLA 3 – Griglia MODFLOW 2D (flopy.modflow.ModflowDis)
+#           con Z-offset chirurgico e localizzazione sensori tensiometrici
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# FISICA DELL'OFFSET DI DATUM
+# GEOMETRIA CELLE:
 # ───────────────────────────────────────────────────────────────────────────
-# Vero Piano Campagna (TGS)         ━━━━━━━━━━━  z_TGS
-# Elettrodi (piantati -10 cm TGS)   ═══════════  z_el = z_TGS - 0.10
-# TOP del modello MODFLOW           = z_el
+# Gli elettrodi (48) sono i BORDI delle colonne.
+# ncol = 48 - 1 = 47 celle. Il centro X della cella j è la media di X[j] e X[j+1].
+# Il top della cella j è la media delle quote Z degli elettrodi ai suoi bordi.
 #
-# Tens.1 a -30 cm dal TGS  =  z_TGS - 0.30  =  z_el - 0.20  (20 cm dal top)
-# Tens.2 a -80 cm dal TGS  =  z_TGS - 0.80  =  z_el - 0.70  (70 cm dal top)
-#
-# CALCOLO SPESSORI LAYER per centratura esatta dei nodi:
+# Z-OFFSET CHIRURGICO (5 layer):
 # ───────────────────────────────────────────────────────────────────────────
-# Layer 1: centro = Dz1/2 = 0.20 m  -->  Dz1 = 0.40 m  ✓
-# Layer 2: centro = Dz1 + Dz2/2 = 0.70 m  -->  Dz2 = 0.60 m  ✓
-# Layer 3–6: spessori progressivi per coprire 20 m di dominio
+# Vero Piano Campagna (TGS)           z_TGS
+# Elettrodi (piantati -10 cm dal TGS) z_el = z_TGS - 0.10
+# TOP modello MODFLOW                 top_elev = z_el  (le 47 medie)
+#
+# Basi layer (offset dal top_elev di ogni cella):
+#   L1 base: top_elev - 0.1   → centro L1 a -0.05 m dal top
+#   L2 base: top_elev - 0.3   → centro L2 a -0.20 m dal top
+#                                  → -0.20 + (-0.10) = -0.30 m dal TGS  ✓ Tens.1
+#   L3 base: top_elev - 0.5   → centro L3 a -0.40 m dal top
+#   L4 base: top_elev - 0.9   → centro L4 a -0.70 m dal top
+#                                  → -0.70 + (-0.10) = -0.80 m dal TGS  ✓ Tens.2
+#   L5 base: top_elev - 4.0   → copre l'intera zona vadosa attiva
 # ───────────────────────────────────────────────────────────────────────────
 import numpy as np
 import flopy
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# ── Coordinate elettrodi (da Cella 1) ────────────────────────────────────
-x_arr = np.array([p[0] for p in el_pos])
-z_arr = np.array([p[1] for p in el_pos])   # quota elettrodi = TOP del modello
+# ── 1. Arrays da Cella 1 ─────────────────────────────────────────────────
+x_arr = np.array([p[0] for p in el_pos])   # 48 posizioni X degli elettrodi [m]
+z_arr = np.array([p[1] for p in el_pos])   # 48 quote Z degli elettrodi [m a.s.l.]
 
-N_ELEC       = len(x_arr)                          # 48
-ELEC_SPACING = float(np.diff(x_arr).mean())        # 1.2 m
+assert len(x_arr) == 48, 'Attesi 48 elettrodi, trovati {}'.format(len(x_arr))
 
-# ── Offset fisico datum ───────────────────────────────────────────────────
-ELEC_OFFSET = 0.10   # [m] elettrodi piantati 10 cm sotto il TGS
-SENS1_TGS   = 0.30   # [m] Tensiometro 1 a 30 cm dal TGS
-SENS2_TGS   = 0.80   # [m] Tensiometro 2 a 80 cm dal TGS
-SENS1_MODEL = SENS1_TGS - ELEC_OFFSET   # = 0.20 m dal top modello
-SENS2_MODEL = SENS2_TGS - ELEC_OFFSET   # = 0.70 m dal top modello
+# ── 2. Griglia orizzontale: ncol = 47 celle (elettrodi = bordi) ───────────
+NCOL = len(x_arr) - 1                              # 47
+NROW = 1                                            # 2D pseudo-profilo
+NLAY = 5                                            # 5 layer chirurgici
 
-# ── Spessori layer [m] ────────────────────────────────────────────────────
-# Derivazione:
-#   Layer 1: Dz1 = 2 * SENS1_MODEL = 2 * 0.20 = 0.40 m
-#   Layer 2: Dz1 + Dz2/2 = 0.70  -->  Dz2 = 2*(0.70 - 0.40) = 0.60 m
-DZ = np.array([
-     0.40,   # Layer 1 – nodo Tens.1 centrato a -20 cm dal top modello
-     0.60,   # Layer 2 – nodo Tens.2 centrato a -70 cm dal top modello
-     1.50,   # Layer 3 – zona vadosa profonda
-     2.50,   # Layer 4 – zona di transizione
-     5.00,   # Layer 5 – zona satura
-    10.00,   # Layer 6 – substrato / acquifero profondo  (tot = 20 m)
-])
-NLAY = len(DZ)   # 6
-NROW = 1         # griglia pseudo-2D (profilo)
-NCOL = N_ELEC    # 48 colonne, una per elettrodo
+delr = np.full(NCOL, 1.2)                          # larghezza cella = 1.2 m uniforme
+delc = np.array([1.0])                             # larghezza riga (pseudo-2D)
 
-# ── Verifica analitica centri cella ──────────────────────────────────────
-cumDZ = np.cumsum(DZ)                  # fondo di ogni layer dal top [m]
-ctrs  = cumDZ - DZ / 2.0              # centri di cella dal top [m]
+# Centri X delle celle (per localizzazione sensori)
+x_col_center = (x_arr[:-1] + x_arr[1:]) / 2.0     # shape (47,)
 
-if abs(ctrs[0] - SENS1_MODEL) > 1e-9:
-    raise AssertionError('Layer 1 centre {:.4f} != target {:.4f}'.format(
-        ctrs[0], SENS1_MODEL))
-if abs(ctrs[1] - SENS2_MODEL) > 1e-9:
-    raise AssertionError('Layer 2 centre {:.4f} != target {:.4f}'.format(
-        ctrs[1], SENS2_MODEL))
+# ── 3. Topografia celle: media delle quote Z agli elettrodi bordo ─────────
+top_elev = (z_arr[:-1] + z_arr[1:]) / 2.0         # shape (47,)  [m a.s.l.]
 
-print('OK  Centri cella verificati analiticamente:')
-print('   Layer 1: {:.3f} m dal top  (target {:.3f} m - Tens.1) OK'.format(
-      ctrs[0], SENS1_MODEL))
-print('   Layer 2: {:.3f} m dal top  (target {:.3f} m - Tens.2) OK'.format(
-      ctrs[1], SENS2_MODEL))
+print('Griglia 2D: NLAY={}, NROW={}, NCOL={}'.format(NLAY, NROW, NCOL))
+print('delr = {:.2f} m (uniforme)'.format(delr[0]))
+print('top_elev : min={:.3f} m  max={:.3f} m  range={:.3f} m'.format(
+    top_elev.min(), top_elev.max(), top_elev.max() - top_elev.min()))
 
-# ── Griglia MODFLOW ───────────────────────────────────────────────────────
-delr   = np.full(NCOL, ELEC_SPACING)    # larghezze colonne = 1.2 m uniforme
-delc   = np.array([1.0])                # larghezza riga (pseudo-2D)
-top_2d = z_arr.reshape(NROW, NCOL)     # top variabile = quota elettrodi
+# ── 4. Basi layer (Z-offset chirurgico) ──────────────────────────────────
+# Tutti gli offset sono RELATIVI a top_elev di ogni cella (topografia variabile)
+# Shape botm: (NLAY, NROW, NCOL) = (5, 1, 47)
+OFFSETS = np.array([0.1, 0.3, 0.5, 0.9, 4.0])   # profondita' basi layer [m]
 
 botm = np.zeros((NLAY, NROW, NCOL))
-for k in range(NLAY):
-    botm[k, 0, :] = z_arr - cumDZ[k]   # fondo assoluto layer k [m a.s.l.]
+for k, dz in enumerate(OFFSETS):
+    botm[k, 0, :] = top_elev - dz                 # quota assoluta base layer k
 
-# ── Costruzione simulazione MODFLOW 6 (Flopy) ────────────────────────────
+# Top array per MODFLOW DIS (shape NROW x NCOL)
+top_2d = top_elev.reshape(NROW, NCOL)
+
+# ── 5. Verifica centri cella (quote assolute) ─────────────────────────────
+# Centro L1: (top_elev + base_L1) / 2 = top_elev - 0.05  → -0.05 m dal top
+# Centro L2: (base_L1 + base_L2) / 2 = top_elev - 0.20  → -0.20 m dal top = -0.30 m TGS
+# Centro L4: (base_L3 + base_L4) / 2 = top_elev - 0.70  → -0.70 m dal top = -0.80 m TGS
+ctr_abs = np.zeros((NLAY, NCOL))
+for k in range(NLAY):
+    top_k = top_elev if k == 0 else botm[k-1, 0, :]
+    bot_k = botm[k, 0, :]
+    ctr_abs[k, :] = (top_k + bot_k) / 2.0
+
+# Offset dal top_elev (dovrebbe essere costante columnwise per verifica)
+ctr_offset = top_elev - ctr_abs[1, :]   # Layer 2: atteso ~0.20 m
+ctr_offset_L4 = top_elev - ctr_abs[3, :]  # Layer 4: atteso ~0.70 m
+print('\nVerifica centri cella (valori medi su 47 colonne):')
+print('  Centro L2 a {:.4f} m sotto top_elev  → {:.4f} m sotto TGS (target -0.30 m)'.format(
+    ctr_offset.mean(), ctr_offset.mean() + 0.10))
+print('  Centro L4 a {:.4f} m sotto top_elev  → {:.4f} m sotto TGS (target -0.80 m)'.format(
+    ctr_offset_L4.mean(), ctr_offset_L4.mean() + 0.10))
+
+# ── 6. Costruzione modello flopy.modflow (MODFLOW 2005) ───────────────────
 MODEL_WS = Path(
-    'C:/Users/luigi/git/github.com/luigimartinoisio-blip/PyHydroGeophysiX/mf6_coupled'
+    'C:/Users/luigi/git/github.com/luigimartinoisio-blip/PyHydroGeophysiX/mf2005_coupled'
 )
 MODEL_WS.mkdir(parents=True, exist_ok=True)
-MODEL_NAME = 'coupled_hydrogeo'
+MODEL_NAME = 'coupled_hydrogeo_dis'
 
-sim = flopy.mf6.MFSimulation(
-    sim_name = MODEL_NAME,
-    sim_ws   = str(MODEL_WS),
-    exe_name = 'mf6',          # 'mf6' deve essere nel PATH di sistema
+model = flopy.modflow.Modflow(
+    modelname = MODEL_NAME,
+    exe_name  = 'mf2005',        # deve essere nel PATH; non eseguito qui
+    model_ws  = str(MODEL_WS),
+    version   = 'mf2005',
 )
-# TDIS – singolo periodo stazionario (placeholder per regime transiente)
-tdis = flopy.mf6.ModflowTdis(
-    sim, nper=1, perioddata=[(1.0, 1, 1.0)]   # (perlen[d], nstp, tsmult)
-)
-# IMS – solutore iterativo
-ims = flopy.mf6.ModflowIms(sim, complexity='MODERATE', outer_maximum=100)
-# GWF – Groundwater Flow Model
-gwf = flopy.mf6.ModflowGwf(sim, modelname=MODEL_NAME, save_flows=True)
-# DIS – griglia strutturata con top variabile (quota elettrodi)
-dis = flopy.mf6.ModflowGwfdis(
-    gwf,
-    nlay=NLAY, nrow=NROW, ncol=NCOL,
-    delr=delr, delc=delc,
-    top=top_2d, botm=botm,
-    length_units='METERS',
-)
-# IC – livello piezometrico iniziale = quota superficie (placeholder)
-ic = flopy.mf6.ModflowGwfic(gwf, strt=top_2d)
-# NPF – proprieta' idrauliche (placeholder; da calibrare con inversione)
-npf = flopy.mf6.ModflowGwfnpf(
-    gwf, k=1e-5, icelltype=1   # Kh [m/s]; celle convertibili (unconfinate)
-)
-# OC – output head e budget
-oc = flopy.mf6.ModflowGwfoc(
-    gwf,
-    head_filerecord   = '{}.hds'.format(MODEL_NAME),
-    budget_filerecord = '{}.bud'.format(MODEL_NAME),
-    saverecord  = [('HEAD', 'ALL'), ('BUDGET', 'ALL')],
-    printrecord = [('HEAD', 'LAST')],
-)
-sim.write_simulation()
-print('\nOK  File MODFLOW 6 scritti in:\n   {}'.format(MODEL_WS))
 
-# ── Tabella struttura layer ───────────────────────────────────────────────
-uses = [
-    'Tens.1 (TGS-{}cm / modello-{}cm)'.format(int(SENS1_TGS*100), int(SENS1_MODEL*100)),
-    'Tens.2 (TGS-{}cm / modello-{}cm)'.format(int(SENS2_TGS*100), int(SENS2_MODEL*100)),
-    'Zona vadosa profonda',
-    'Zona di transizione',
-    'Zona satura',
-    'Substrato / acquifero profondo',
-]
-tops_from_top = np.concatenate([[0.0], cumDZ[:-1]])
-print('\n  STRUTTURA LAYER MODFLOW')
-print('  {:<8}{:<10}{:<18}{:<22}{}'.format(
-      'Layer', 'Dz [m]', 'Top [m top]', 'Centro [m top]', 'Uso'))
-print('  ' + '-' * 72)
-for k in range(NLAY):
-    print('  {:<8}{:<10.2f}{:<18.3f}{:<22.3f}{}'.format(
-          k+1, DZ[k], tops_from_top[k], ctrs[k], uses[k]))
+# DIS – discretizzazione spazio-temporale
+dis = flopy.modflow.ModflowDis(
+    model,
+    nlay = NLAY,
+    nrow = NROW,
+    ncol = NCOL,
+    delr = delr,
+    delc = delc,
+    top  = top_2d,
+    botm = botm,
+    nper = 1,
+    perlen   = [1.0],
+    nstp     = [1],
+    steady   = [True],
+    itmuni   = 4,    # unità tempo: giorni
+    lenuni   = 2,    # unità lunghezza: metri
+)
 
-# ── Visualizzazione sezione verticale ─────────────────────────────────────
-cmap_lay = plt.get_cmap('RdYlBu_r', NLAY)
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10), dpi=110,
-                               gridspec_kw={'height_ratios': [3, 2]})
+print('\nOK  Pacchetto DIS creato:')
+print('   NLAY={}, NROW={}, NCOL={}'.format(dis.nlay, dis.nrow, dis.ncol))
+print('   Extent X: [{:.2f}, {:.2f}] m'.format(
+    float(x_col_center[0]) - 0.6, float(x_col_center[-1]) + 0.6))
+print('   Extent Z: [{:.3f}, {:.3f}] m a.s.l.'.format(
+    float(botm[-1, 0, :].min()), float(top_elev.max())))
 
-ctr1_abs = (z_arr + botm[0, 0, :]) / 2.0
-ctr2_abs = (botm[0, 0, :] + botm[1, 0, :]) / 2.0
+# ── 7. Centri cella (quote assolute) per Layer 2 e Layer 4 ───────────────
+# ModflowDis non espone zcellcenters; usiamo ctr_abs calcolato al passo 5.
+# ctr_abs[k, j] = (top_k[j] + bot_k[j]) / 2  →  shape (NLAY, NCOL)
 
-# — Sezione completa: tutti i layer —
-for k in range(NLAY):
-    top_k = z_arr if k == 0 else botm[k-1, 0, :]
-    bot_k = botm[k, 0, :]
-    ax1.fill_between(x_arr, bot_k, top_k, alpha=0.65, color=cmap_lay(k),
-                     label='Layer {} Dz={:.2f} m'.format(k+1, DZ[k]))
-    ax1.plot(x_arr, (top_k + bot_k) / 2.0, '--', lw=0.7, color=cmap_lay(k), alpha=0.8)
-ax1.plot(x_arr, z_arr, 'k-', lw=2, label='Top modello (elettrodi)')
-ax1.plot(x_arr, z_arr + ELEC_OFFSET, 'k--', lw=1.2, alpha=0.6,
-         label='Vero piano campagna (+{}cm)'.format(int(ELEC_OFFSET*100)))
-ax1.plot(x_arr, ctr1_abs, 'rs', ms=6, zorder=12,
-         label='Nodo Tens.1 (mod.-{}cm / TGS-{}cm)'.format(
-             int(SENS1_MODEL*100), int(SENS1_TGS*100)))
-ax1.plot(x_arr, ctr2_abs, 'b^', ms=6, zorder=12,
-         label='Nodo Tens.2 (mod.-{}cm / TGS-{}cm)'.format(
-             int(SENS2_MODEL*100), int(SENS2_TGS*100)))
-ax1.set_xlabel('X [m]', fontsize=11)
-ax1.set_ylabel('Z [m a.s.l.]', fontsize=11)
-ax1.set_title('Griglia MODFLOW - Sezione Verticale con Offset di Datum',
-              fontsize=13, fontweight='bold')
-ax1.legend(loc='lower left', fontsize=8, ncol=2)
+# Layer 2 → indice 1;  Layer 4 → indice 3
+z_L2 = ctr_abs[1, :]   # shape (47,)   [m a.s.l.]
+z_L4 = ctr_abs[3, :]   # shape (47,)   [m a.s.l.]
+
+# ── 8. Localizzazione sensori a X = 8 m, 31 m, 51 m ──────────────────────
+SENS_X_TARGETS = [8.0, 31.0, 51.0]   # [m] posizioni nominali sensori
+
+print('\n' + '=' * 72)
+print('  REPORT SENSORI TENSIOMETRICI – POSIZIONI E QUOTE NODALI')
+print('  (Layer 2 ≈ -30 cm TGS  |  Layer 4 ≈ -80 cm TGS)')
+print('=' * 72)
+print('  {:<10}{:<10}{:<18}{:<22}{:<22}'.format(
+    'X target', 'col_idx', 'X cella [m]', 'Z nodo L2 [m asl]', 'Z nodo L4 [m asl]'))
+print('  ' + '-' * 70)
+
+for x_target in SENS_X_TARGETS:
+    # Indice di colonna più vicino al target
+    col_idx = int(np.argmin(np.abs(x_col_center - x_target)))
+    x_real  = float(x_col_center[col_idx])
+    z_sens2 = float(z_L2[col_idx])
+    z_sens4 = float(z_L4[col_idx])
+    print('  {:<10.1f}{:<10d}{:<18.4f}{:<22.4f}{:<22.4f}'.format(
+        x_target, col_idx, x_real, z_sens2, z_sens4))
+
+print('=' * 72)
+print()
+print('Nota: Z nodo = quota assoluta centro-cella [m a.s.l.].')
+print('      L2 centro a -0.20 m dal top modello = -0.30 m dal TGS.')
+print('      L4 centro a -0.70 m dal top modello = -0.80 m dal TGS.')
+print()
+print('OK  Cella 3 completata. Modello MODFLOW 2005 pronto (non eseguito).')
+print('    Workspace: {}'.format(MODEL_WS))
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELLA 4 – Funzioni Petrofisiche Pure (Van Genuchten + Archie)
+# ─────────────────────────────────────────────────────────────────────────────
+CELL4 = r"""
+# ═══════════════════════════════════════════════════════════════════════════
+# CELLA 4 – Funzioni Petrofisiche: Van Genuchten & Legge di Archie
+#
+# Scopo : tradurre output idrologici (carico di pressione h) in input
+#         geofisici (resistività elettrica bulk rho_b) attraverso:
+#
+#   MODFLOW  →  h [m]  →  vg_theta()  →  θ [-]  →  archie_rho()  →  ρ_b [Ω·m]
+#
+# Funzioni vettorializzate su array numpy, gestione singolarità inclusa.
+# ═══════════════════════════════════════════════════════════════════════════
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+# ── 1. Van Genuchten (1980) ───────────────────────────────────────────────
+def vg_theta(h, theta_r, theta_s, alpha, n_vg):
+    # Contenuto d'acqua volumetrico theta [-]  (Van Genuchten 1980).
+    # h       : carico di pressione [m]   (h < 0 = insaturo)
+    # theta_r : contenuto d'acqua residuo [-]
+    # theta_s : contenuto d'acqua a saturazione [-]
+    # alpha   : param. di scala VG [1/m]
+    # n_vg    : param. di forma VG [-]  (n > 1)
+    # m_vg    = 1 - 1/n_vg  (Mualem)
+    # Per h >= 0 si forza theta = theta_s.
+    h    = np.asarray(h, dtype=float)
+    m_vg = 1.0 - 1.0 / n_vg
+
+    # Calcolo su tutto l'array (formula matriciale, no loop)
+    Se    = 1.0 / (1.0 + np.abs(alpha * h) ** n_vg) ** m_vg
+    theta = theta_r + (theta_s - theta_r) * Se
+
+    # Condizione di saturazione: h >= 0 → theta = theta_s
+    theta = np.where(h >= 0.0, theta_s, theta)
+    return theta
+
+
+# ── 2. Legge di Archie generalizzata (insaturo) ───────────────────────────
+def archie_rho(theta, porosity, rho_w, m, n_arch):
+    # Resistivita' bulk rho_b [ohm*m]  (Archie generalizzato, insaturo).
+    # theta    : contenuto d'acqua volumetrico [-]
+    # porosity : porosita' totale phi          [-]
+    # rho_w    : resistivita' acqua di poro    [ohm*m]
+    # m        : esponente di cementazione     [-]
+    # n_arch   : esponente di saturazione      [-]
+    # S_w = theta/phi  clampato in [1e-8, 1.0]  per evitare singolarita'.
+    # rho_b = rho_w * phi^(-m) * S_w^(-n)
+    theta = np.asarray(theta, dtype=float)
+    Sw    = theta / porosity
+    Sw    = np.clip(Sw, 1e-8, 1.0)          # evita Sw=0 e Sw>1
+    rho_b = rho_w * porosity**(-m) * Sw**(-n_arch)
+    return rho_b
+
+
+print('OK  Funzioni petrofisiche definite:')
+print('   vg_theta(h, theta_r, theta_s, alpha, n_vg)   → θ [-]')
+print('   archie_rho(theta, porosity, rho_w, m, n_arch) → ρ_b [Ω·m]')
+
+# ── 3. Parametri tipici: limo/argilla ────────────────────────────────────
+THETA_S   = 0.45    # contenuto d'acqua a saturazione  [-]
+THETA_R   = 0.08    # contenuto d'acqua residuo        [-]
+ALPHA_VG  = 1.5     # parametro di scala VG            [1/m]
+N_VG      = 1.4     # parametro di forma VG            [-]
+POROSITY  = 0.45    # porosità totale                  [-]
+RHO_W     = 20.0    # resistività acqua di poro        [Ω·m]
+M_ARCH    = 1.8     # esponente di cementazione        [-]
+N_ARCH    = 2.0     # esponente di saturazione         [-]
+
+# ── 4. Array di carico di pressione (0 → -10 m) ──────────────────────────
+h_test = np.linspace(0.0, -10.0, 500)     # [m]  suzione crescente
+
+# ── 5. Funzioni a cascata ────────────────────────────────────────────────
+theta_test = vg_theta(h_test, THETA_R, THETA_S, ALPHA_VG, N_VG)
+rho_test   = archie_rho(theta_test, POROSITY, RHO_W, M_ARCH, N_ARCH)
+
+# Statistiche rapide
+print('\n  Capo h [m]  │  θ [-]   │  ρ_b [Ω·m]')
+print('  ' + '─' * 40)
+for h_val in [0.0, -0.1, -0.5, -1.0, -3.0, -10.0]:
+    idx = int(np.argmin(np.abs(h_test - h_val)))
+    print('  {:>10.1f}  │  {:.4f}  │  {:>9.2f}'.format(
+        h_test[idx], theta_test[idx], rho_test[idx]))
+
+# ── 6. Visualizzazione ───────────────────────────────────────────────────
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5), dpi=115)
+fig.suptitle(
+    'Funzioni Petrofisiche  –  Limo/Argilla\n'
+    r'($\theta_s$={:.2f}, $\theta_r$={:.2f}, $\alpha$={:.1f} m$^{{-1}}$, '
+    r'$n_{{VG}}$={:.1f}, $\phi$={:.2f}, $\rho_w$={:.0f} Ω·m, '
+    r'$m$={:.1f}, $n_{{arch}}$={:.1f})'.format(
+        THETA_S, THETA_R, ALPHA_VG, N_VG,
+        POROSITY, RHO_W, M_ARCH, N_ARCH),
+    fontsize=10, fontweight='bold')
+
+# ─ Subplot 1: Curva di ritenzione idrica h vs θ ─
+ax1.plot(h_test, theta_test, color='#2E86AB', lw=2.0)
+ax1.axhline(THETA_S, color='#2E86AB', lw=0.8, ls='--', alpha=0.6,
+            label=r'$\theta_s = {:.2f}$'.format(THETA_S))
+ax1.axhline(THETA_R, color='#A23B72', lw=0.8, ls='--', alpha=0.6,
+            label=r'$\theta_r = {:.2f}$'.format(THETA_R))
+# Punti tensiometrici tipici (profondità 30 e 80 cm dal TGS → h indicativo)
+for h_mark, lbl, col in [(-0.3, 'Tens.1 (-30 cm)', '#E84855'),
+                          (-0.8, 'Tens.2 (-80 cm)', '#FF8C42')]:
+    th_m = vg_theta(h_mark, THETA_R, THETA_S, ALPHA_VG, N_VG)
+    ax1.scatter([h_mark], [th_m], s=60, zorder=8, color=col, label=lbl)
+ax1.set_xlabel('Carico di pressione  $h$  [m]', fontsize=11)
+ax1.set_ylabel('Contenuto acqua  $\\theta$  [-]', fontsize=11)
+ax1.set_title('Curva di ritenzione idrica (VG)', fontsize=11, fontweight='bold')
+ax1.invert_xaxis()          # suzione decrescente verso destra (asse h invertito)
+ax1.set_xlim(0, -10)
+ax1.legend(fontsize=9)
 ax1.grid(True, alpha=0.3, linestyle='--')
 
-# — Zoom layer 1-2 (zona sensori) —
-for k in range(2):
-    top_k = z_arr if k == 0 else botm[k-1, 0, :]
-    bot_k = botm[k, 0, :]
-    ax2.fill_between(x_arr, bot_k, top_k, alpha=0.70, color=cmap_lay(k),
-                     label='Layer {} Dz={:.2f} m - centro -{:.0f}cm'.format(
-                         k+1, DZ[k], ctrs[k]*100))
-ax2.plot(x_arr, z_arr, 'k-', lw=2, label='Top (elettrodi)')
-ax2.plot(x_arr, z_arr + ELEC_OFFSET, 'k--', lw=1.2, alpha=0.6, label='TGS')
-ax2.plot(x_arr, ctr1_abs, 'rs', ms=7, zorder=12,
-         label='Tens.1 → -{:.0f}cm'.format(SENS1_MODEL*100))
-ax2.plot(x_arr, ctr2_abs, 'b^', ms=7, zorder=12,
-         label='Tens.2 → -{:.0f}cm'.format(SENS2_MODEL*100))
-ax2.set_ylim(z_arr.min() - cumDZ[1] - 0.3, z_arr.max() + 0.3)
-ax2.set_xlabel('X [m]', fontsize=11)
-ax2.set_ylabel('Z [m a.s.l.]', fontsize=11)
-ax2.set_title('Zoom Layer 1-2: Zona Sensori (Vadosa Superficiale)',
-              fontsize=11, fontweight='bold')
-ax2.legend(loc='lower left', fontsize=9)
-ax2.grid(True, alpha=0.3, linestyle='--')
+# ─ Subplot 2: Curva petrofisica θ vs ρ_b ─
+ax2.semilogy(theta_test, rho_test, color='#8B2FC9', lw=2.0)
+# Punti tensiometrici
+for h_mark, lbl, col in [(-0.3, 'Tens.1 (-30 cm)', '#E84855'),
+                          (-0.8, 'Tens.2 (-80 cm)', '#FF8C42')]:
+    th_m  = vg_theta(h_mark, THETA_R, THETA_S, ALPHA_VG, N_VG)
+    rho_m = archie_rho(th_m, POROSITY, RHO_W, M_ARCH, N_ARCH)
+    ax2.scatter([th_m], [rho_m], s=60, zorder=8, color=col, label=lbl)
+ax2.set_xlabel('Contenuto acqua  $\\theta$  [-]', fontsize=11)
+ax2.set_ylabel('Resistivita bulk  $\\rho_b$  [ohm*m]', fontsize=11)
+ax2.set_title('Curva petrofisica Archie (scala log rho)', fontsize=11, fontweight='bold')
+ax2.yaxis.set_major_formatter(ticker.ScalarFormatter())
+ax2.legend(fontsize=9)
+ax2.grid(True, which='both', alpha=0.3, linestyle='--')
+
 plt.tight_layout()
 plt.show()
 
-# ── Verifica numerica colonna centrale ────────────────────────────────────
-j_ref = NCOL // 2
-print('\n  VERIFICA NUMERICA (colonna j={}, X={:.1f} m)'.format(j_ref, x_arr[j_ref]))
-print('  {:<6}{:<16}{:<16}{:<18}{:<16}{}'.format(
-      'Layer', 'Top[a.s.l.]', 'Bot[a.s.l.]', 'Centro[a.s.l.]', 'Dal top[m]', 'Nota'))
-print('  ' + '-' * 82)
-for k in range(NLAY):
-    tk = float(z_arr[j_ref]) if k == 0 else float(botm[k-1, 0, j_ref])
-    bk = float(botm[k, 0, j_ref])
-    ck = (tk + bk) / 2.0
-    dk = float(z_arr[j_ref]) - ck
-    flag = '<- Tens.1 OK' if k == 0 else ('<- Tens.2 OK' if k == 1 else '')
-    print('  {:<6}{:<16.3f}{:<16.3f}{:<18.3f}{:<16.3f}{}'.format(
-          k+1, tk, bk, ck, dk, flag))
-print()
-print('OK  MODFLOW 6 pronto per accoppiamento con forward ERT (PyGIMLi mesh)')
-print('   Offs.: elettrodi a -{}cm sotto TGS'.format(int(ELEC_OFFSET*100)))
-print('   Tens.1 TGS-{}cm → Layer 1 nodo a -{}cm dal top modello'.format(
-      int(SENS1_TGS*100), int(SENS1_MODEL*100)))
-print('   Tens.2 TGS-{}cm → Layer 2 nodo a -{}cm dal top modello'.format(
-      int(SENS2_TGS*100), int(SENS2_MODEL*100)))
+print('\nOK  Cella 4 completata.')
+print('   θ(h = 0.0 m) = {:.4f}  →  ρ_b = {:.2f} Ω·m  (saturo)'.format(
+    float(vg_theta(0.0,   THETA_R, THETA_S, ALPHA_VG, N_VG)),
+    float(archie_rho(THETA_S, POROSITY, RHO_W, M_ARCH, N_ARCH))))
+print('   θ(h = -3.0 m) = {:.4f}  →  ρ_b = {:.2f} Ω·m'.format(
+    float(vg_theta(-3.0,  THETA_R, THETA_S, ALPHA_VG, N_VG)),
+    float(archie_rho(vg_theta(-3.0, THETA_R, THETA_S, ALPHA_VG, N_VG),
+                     POROSITY, RHO_W, M_ARCH, N_ARCH))))
+print('   θ(h = -10.0 m) = {:.4f}  →  ρ_b = {:.2f} Ω·m  (quasi-residuo)'.format(
+    float(vg_theta(-10.0, THETA_R, THETA_S, ALPHA_VG, N_VG)),
+    float(archie_rho(vg_theta(-10.0, THETA_R, THETA_S, ALPHA_VG, N_VG),
+                     POROSITY, RHO_W, M_ARCH, N_ARCH))))
 """
 
 
@@ -536,12 +628,14 @@ notebook = {
                 'Test sintetico 2D accoppiato:\n'
                 '- **Cella 1** – Parsing dati reali → `el_pos` (48 elettrodi)\n'
                 '- **Cella 2** – Mesh geofisica PyGIMLi (Zona Vadosa marker=1, Substrato+Padding marker=2)\n'
-                '- **Cella 3** – Griglia MODFLOW con offset datum elettrodi/tensiometri'
+                '- **Cella 3** – Griglia MODFLOW 2005 con offset datum elettrodi/tensiometri\n'
+                '- **Cella 4** – Funzioni petrofisiche: Van Genuchten + Archie (h → θ → ρ_b)'
             ),
         },
         make_code_cell(CELL1),
         make_code_cell(CELL2),
         make_code_cell(CELL3),
+        make_code_cell(CELL4),
     ],
 }
 
