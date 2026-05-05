@@ -47,6 +47,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
 
@@ -240,7 +241,7 @@ class MeterConnector(BaseConnector):
                 f"[MeterConnector] Expected column '{self._TIMESTAMP_COL}' "
                 f"not found in {p}."
             ) from exc
-        except Exception as exc:
+        except (OSError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(
                 f"[MeterConnector] Failed to parse {p}: {exc}"
             ) from exc
@@ -294,7 +295,7 @@ class ERTConnector(BaseConnector):
                 f"[ERTConnector] Expected column '{self._TIMESTAMP_COL}' "
                 f"not found in {p}."
             ) from exc
-        except Exception as exc:
+        except (OSError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(
                 f"[ERTConnector] Failed to parse {p}: {exc}"
             ) from exc
@@ -348,7 +349,7 @@ class MeteoConnector(BaseConnector):
                 f"[MeteoConnector] Expected column '{self._TIMESTAMP_COL}' "
                 f"not found in {p}."
             ) from exc
-        except Exception as exc:
+        except (OSError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(
                 f"[MeteoConnector] Failed to parse {p}: {exc}"
             ) from exc
@@ -440,7 +441,7 @@ class CosmosConnector(BaseConnector):
         # ── 1. Read raw CSV without any date parsing ─────────────────────────
         try:
             df_raw = pd.read_csv(p, dtype=str)
-        except Exception as exc:
+        except (OSError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(
                 f"[CosmosConnector] Failed to read CSV {p}: {exc}"
             ) from exc
@@ -463,12 +464,22 @@ class CosmosConnector(BaseConnector):
         # ── 4. Parse dates (DD-Mon-YY, dayfirst=True) ───────────────────────
         try:
             dates = pd.to_datetime(
-                df_raw[self._DATE_COL], dayfirst=True, format="%d-%b-%y"
+                df_raw[self._DATE_COL],
+                dayfirst=True,
+                format="%d-%b-%y",
+                errors="coerce",
             )
         except Exception as exc:
             raise ValueError(
                 f"[CosmosConnector] Date parsing failed in {p}: {exc}"
             ) from exc
+
+        nat_count = int(dates.isna().sum())
+        if nat_count:
+            logger.warning(
+                "[CosmosConnector] %d date(s) could not be parsed and will be dropped.",
+                nat_count,
+            )
 
         # ── 5. Build clean DataFrame ─────────────────────────────────────────
         df = df_raw.drop(columns=[self._DATE_COL]).copy()
@@ -482,7 +493,8 @@ class CosmosConnector(BaseConnector):
         df.index = self._ensure_utc(df.index)
         df.index.name = "datetime_utc"
 
-        # Drop rows where all measurements are NaN
+        # Drop rows with unparseable dates (NaT) or all-NaN measurements
+        df = df[df.index.notna()]
         df = df.dropna(how="all")
 
         logger.info(
@@ -586,11 +598,26 @@ class SpatialConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     def _parse_topography(self, p: Path) -> pd.DataFrame:
-        """Parse a ``#,X,Y,Z[,Depth]`` comma-separated file."""
-        df = pd.read_csv(p, index_col=self._TOPO_INDEX_COL)
+        """Parse a ``#,X,Y,Z[,Depth]`` comma-separated file.
+
+        Lines that begin with ``#`` (including the header) are treated as
+        comments and skipped; column names are derived from the first such
+        header line so the optional ``Depth`` column is handled automatically.
+        """
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            raw_header = fh.readline().rstrip("\r\n")
+        col_names = [c.strip() for c in raw_header.lstrip("#").split(",") if c.strip()]
+        df = pd.read_csv(
+            p,
+            comment="#",
+            header=None,
+            names=[self._TOPO_INDEX_COL] + col_names,
+            sep=",",
+            skipinitialspace=True,
+        )
+        df = df.set_index(self._TOPO_INDEX_COL)
         df.index = df.index.astype(int)
         df.index.name = "electrode_id"
-        # Cast all coordinate columns to float
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(how="all")
@@ -611,6 +638,16 @@ class SpatialConnector(BaseConnector):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(how="all")
         return df
+
+
+class SequenceData(NamedTuple):
+    """Return value of :meth:`SequenceConnector.parse_data`.
+
+    Supports tuple unpacking: ``electrodes_df, sequence_df = connector.parse_data(path)``
+    """
+
+    electrodes: pd.DataFrame
+    sequence: pd.DataFrame
 
 
 class SequenceConnector(BaseConnector):
@@ -655,7 +692,7 @@ class SequenceConnector(BaseConnector):
 
     def parse_data(  # type: ignore[override]
         self, file_path: Path
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> SequenceData:
         """Parse a two-block ERT sequence file.
 
         Parameters
@@ -665,8 +702,9 @@ class SequenceConnector(BaseConnector):
 
         Returns
         -------
-        tuple[pandas.DataFrame, pandas.DataFrame]
-            ``(electrodes_df, sequence_df)`` – see class docstring.
+        SequenceData
+            Named tuple with fields ``electrodes`` and ``sequence``.
+            Supports unpacking: ``electrodes_df, sequence_df = connector.parse_data(path)``.
 
         Raises
         ------
@@ -703,6 +741,7 @@ class SequenceConnector(BaseConnector):
             header_fields = ["#"] + [h for h in raw_header.split("\t") if h]
             data_lines = raw_lines[start + 1 : end]
             rows = []
+            skipped = 0
             for ln in data_lines:
                 ln = ln.strip()
                 if not ln:
@@ -712,8 +751,15 @@ class SequenceConnector(BaseConnector):
                     logger.warning(
                         "[SequenceConnector] Skipping malformed line: %r", ln
                     )
+                    skipped += 1
                     continue
                 rows.append(parts)
+            if not rows:
+                raise ValueError(
+                    f"[SequenceConnector] Block starting at line {start + 1} "
+                    f"in {p} produced no valid rows "
+                    f"({skipped} malformed lines skipped)."
+                )
             df = pd.DataFrame(rows, columns=header_fields)
             # The first column is always the sequential index '#'
             df[header_fields[0]] = pd.to_numeric(df[header_fields[0]], errors="coerce")
@@ -733,9 +779,16 @@ class SequenceConnector(BaseConnector):
         sequence_df = _parse_block(
             block_starts[1], None, index_name="measurement_id"
         )
-        # Cast electrode index columns to int
+        # Cast electrode index columns to int – raise clearly if NaN remain after coerce
         for col in ["A", "B", "M", "N"]:
             if col in sequence_df.columns:
+                nan_mask = sequence_df[col].isna()
+                if nan_mask.any():
+                    bad_idx = sequence_df.index[nan_mask].tolist()
+                    raise ValueError(
+                        f"[SequenceConnector] Column '{col}' contains non-numeric "
+                        f"values at measurement_id(s) {bad_idx} in {p}."
+                    )
                 sequence_df[col] = sequence_df[col].astype(int)
 
         logger.info(
@@ -743,7 +796,7 @@ class SequenceConnector(BaseConnector):
             len(electrodes_df),
             len(sequence_df),
         )
-        return electrodes_df, sequence_df
+        return SequenceData(electrodes=electrodes_df, sequence=sequence_df)
 
 
 # ---------------------------------------------------------------------------

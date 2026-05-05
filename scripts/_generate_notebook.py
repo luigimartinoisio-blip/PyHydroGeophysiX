@@ -23,7 +23,7 @@ from pathlib import Path
 
 # ── Directory di input ────────────────────────────────────────────────────
 INPUT_DIR = Path(
-    'C:/Users/luigi/git/github.com/luigimartinoisio-blip/PyHydroGeophysiX/Position'
+    '../data/raw/Position'
 )
 
 # ── 1. Lettura 08topog_TL.txt ─────────────────────────────────────────────
@@ -354,7 +354,7 @@ print('  Centro L4 a {:.4f} m sotto top_elev  → {:.4f} m sotto TGS (target -0.
 
 # ── 6. Costruzione modello flopy.modflow (MODFLOW 2005) ───────────────────
 MODEL_WS = Path(
-    'C:/Users/luigi/git/github.com/luigimartinoisio-blip/PyHydroGeophysiX/mf2005_coupled'
+    '../mf2005_coupled'
 )
 MODEL_WS.mkdir(parents=True, exist_ok=True)
 MODEL_NAME = 'coupled_hydrogeo_dis'
@@ -639,10 +639,7 @@ notebook = {
     ],
 }
 
-OUTPUT = Path(
-    'C:/Users/luigi/git/github.com/luigimartinoisio-blip/PyHydroGeophysiX'
-    '/Coupled_2D_Hydrogeophysical_Modeling.ipynb'
-)
+OUTPUT = Path(__file__).resolve().parent / 'Coupled_2D_Hydrogeophysical_Modeling.ipynb'
 
 with open(OUTPUT, 'w', encoding='utf-8') as f:
     json.dump(notebook, f, indent=1, ensure_ascii=False)
