@@ -4,7 +4,7 @@ Coupled hydrogeophysical modeling framework for the Carlone field site.
 
 ## Overview
 
-PyHydroGeophysiX_Carl integrates field sensor data (ERT, water level, meteorological, cosmic-ray neutron sensors) with hydrological and geophysical simulations for coupled 2D hydrogeophysical modeling.
+PyHydroGeophysiX_Carl integrates field sensor data (ERT, water content, meteorological, cosmic-ray neutron sensors) with hydrological and geophysical simulations for coupled 2D hydrogeophysical modeling.
 
 ## Project Structure
 
